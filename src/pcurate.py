@@ -1,309 +1,259 @@
-"""pcurate.
+#!/usr/bin/env python3
+"""pcurate: A utility for curating Arch Linux/macOS/Debian software package lists."""
 
-Usage:
-  pcurate PACKAGE_NAME [-u | -s [-t TAG] [-d DESCRIPTION]]
-  pcurate ( -c | -r | -m ) [-n | -f] [-v]
-  pcurate ( -h | --help | --version)
+__version__ = '0.3.0'
 
-Options:
-  -u --unset              Unset package curated status
-  -s --set                Set package curated status
-  -t tag --tag tag        Set package tag
-  -d desc --desc desc     Set package description
-  -c --curated            Display all curated packages
-  -r --regular            Display packages not curated
-  -m --missing            Display missing curated packages
-  -n --native             Limit display to native packages
-  -f --foreign            Limit display to foreign packages
-  -v --verbose            Display additional info (csv)
-  -h --help               Display help
-  --version               Display pcurate version
-
-"""
-
-__version__ = '0.1.6'
-
-# standard lib import
+import argparse
+import csv
+import json
 import os
-import re
-import sqlite3
+import shutil
 import subprocess
+import sys
+from typing import Any, Dict, List
 
-# third party import
-from docopt import docopt
+class PackageManager:
+    """Abstract base class for package manager drivers."""
+    def get_installed(self) -> Dict[str, Dict[str, Any]]:
+        """Return dict of package_name -> {'description': str, 'native': int}."""
+        return {}
+    
+    def resolve_groups(self, names: List[str]) -> List[str]:
+        """Resolve package group names to individual package names."""
+        return names
 
-
-class Package:
-    """A class to store and retrieve info for Arch Linux software packages.
-
-    Attributes
-    ----------
-    name : str
-        the name of the software package
-    curated : int
-        value of 1 marks package as a keeper (default 0)
-    tag : str
-        optional curated package tag (default None)
-    description : str
-        optional curated package desc (if None will use stock desc)
-    native: int
-        value of 1 marks package as native (default 0)
-    """
-
-    def __init__(self, name, curated=0, tag=None, description=None,
-                 native=0) -> None:
-        """Init package object representing Arch Linux software package.
-
-        Parameters
-        ----------
-        name : str
-            the name of the software package
-        curated : int
-            value of 1 marks package as a keeper (default 0)
-        tag : str
-            optional for curated package categorization (default None)
-        description : str
-            optional curated package desc (if None will use stock desc)
-        native : int
-            value of 1 marks package as native (default 0)
-        """
-        self.name = name
-        self.curated = curated
-        self.tag = tag
-        self.description = description
-        self.native = native
-
-    def add(self, db) -> None:
-        """Take db connect obj, adds a package and its attributes to db."""
-        db.execute("""INSERT OR IGNORE INTO packages VALUES (:name, :curated,
-                   :tag, :description, :native)""", {
-                   'name': self.name, 'curated': self.curated, 'tag': self.tag,
-                   'description': self.description, 'native': self.native})
-
-    def modify(self, db) -> None:
-        """Take db connect obj, modifies attributes of a package in db."""
-        db.execute("""UPDATE packages SET curated = ifnull(:curated,curated),
-                   tag = ifnull(:tag,tag), description = ifnull(:description,
-                   description), native = ifnull(:native,native) WHERE name
-                   = :name""", {
-                   'name': self.name, 'curated': self.curated, 'tag': self.tag,
-                   'description': self.description, 'native': self.native})
-
-    def display(self, db) -> str:
-        """Take db connect obj, displays attribs stored for package in db."""
-        o = db.query('Select * FROM packages WHERE name = :name',
-                     {'name': self.name})
+class PacmanManager(PackageManager):
+    """Arch Linux package manager driver."""
+    def get_installed(self) -> Dict[str, Dict[str, Any]]:
+        pkgs = {}
         try:
-            name, curated, tag, description, native = o[0]
-            curated = ',curated,' if curated == 1 else ',regular,'
-            native = ',native' if native == 1 else ',foreign'
-            print(name + curated + tag + "," + description + native)
-            return o
-        except IndexError:
-            print("package not excplicitly installed (" + self.name + ")")
-            return 'no_match'
+            out = subprocess.check_output(['pacman', '-Qei'], text=True)
+            status, native_out = subprocess.getstatusoutput('pacman -Qqen')
+            native = set(native_out.splitlines()) if status == 0 else set()
+            current = None
+            for line in out.splitlines():
+                if line.startswith('Name'):
+                    current = line.split(': ', 1)[1].strip()
+                elif line.startswith('Description') and current:
+                    desc = line.split(': ', 1)[1].strip()
+                    pkgs[current] = {'description': desc, 'native': 1 if current in native else 0}
+                    current = None
+        except Exception:
+            pass
+        return pkgs
 
+    def resolve_groups(self, names: List[str]) -> List[str]:
+        if not names:
+            return []
+        try:
+            res = subprocess.run(['pacman', '-Sgq'] + names, capture_output=True, text=True, check=False)
+            if res.returncode == 0:
+                return res.stdout.splitlines()
+        except Exception:
+            pass
+        return []
 
-class Database:
-    """A class to handle a sqlite db of Arch linux software package info.
+class BrewManager(PackageManager):
+    """macOS Homebrew package manager driver."""
+    def get_installed(self) -> Dict[str, Dict[str, Any]]:
+        pkgs = {}
+        try:
+            out = subprocess.check_output(['brew', 'info', '--json=v2', '--installed'], text=True)
+            data = json.loads(out)
+            for f in data.get('formulae', []):
+                pkgs[f['name']] = {'description': f.get('desc', ''), 'native': 1}
+            for c in data.get('casks', []):
+                pkgs[c['token']] = {'description': c.get('desc', '') or '', 'native': 0}
+        except Exception:
+            pass
+        return pkgs
 
-    Attributes
-    ----------
-    conn
-        database connection object
-    cursor
-        database cursor object
-    """
+class AptManager(PackageManager):
+    """Debian/Ubuntu APT package manager driver."""
+    def get_installed(self) -> Dict[str, Dict[str, Any]]:
+        pkgs = {}
+        try:
+            res = subprocess.run(['apt-mark', 'showmanual'], capture_output=True, text=True, check=False)
+            if res.returncode == 0:
+                manual = [p.strip() for p in res.stdout.splitlines() if p.strip()]
+                if manual:
+                    res_query = subprocess.run(
+                        ['dpkg-query', '-W', '-f=${Package}\t${Description}\n'] + manual,
+                        capture_output=True, text=True, check=False
+                    )
+                    for line in res_query.stdout.splitlines():
+                        if '\t' in line:
+                            n, d = line.split('\t', 1)
+                            pkgs[n] = {'description': d.strip(), 'native': 1}
+        except Exception:
+            pass
+        return pkgs
 
-    def __init__(self, db_path) -> None:
-        """Take str path to db and initialize it, create it if not exist."""
-        self.conn = sqlite3.connect(db_path)
-        self.cursor = self.conn.cursor()
-        self.cursor.execute("""CREATE TABLE IF NOT EXISTS packages (name text
-                            PRIMARY KEY,curated integer,tag text,description
-                            text,native integer)""")
-        # if db is new assign current db version
-        current_db_version = 1
-        user_ver = int(self.query('PRAGMA user_version')[0][0])
-        user_ver = current_db_version if user_ver == 0 else user_ver
-        self.cursor.execute("PRAGMA user_version = {v:d}".format(v=user_ver))
-        # migration for alpha db
-        if len(self.query("PRAGMA table_info('packages')")) == 4:
-            self.cursor.execute("""ALTER TABLE packages ADD COLUMN native
-                                integer""")
+class Pcurate:
+    """Core logic runner for package curation."""
+    def __init__(self, config_dir: str = None, pm: PackageManager = None) -> None:
+        if not config_dir:
+            xdg = os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config')
+            config_dir = os.path.join(xdg, 'pcurate')
+        self.config_dir = config_dir
+        os.makedirs(self.config_dir, exist_ok=True)
+        self.json_path = os.path.join(self.config_dir, 'curated.json')
+        self.filter_path = os.path.join(self.config_dir, 'filter.txt')
+        self.pm = pm or self.detect_pm()
 
-    def __enter__(self) -> 'Database':
-        """Bind db instance to context manager."""
-        return self
+    def detect_pm(self) -> PackageManager:
+        if shutil.which('pacman'):
+            return PacmanManager()
+        if shutil.which('brew'):
+            return BrewManager()
+        if shutil.which('dpkg-query') and shutil.which('apt-mark'):
+            return AptManager()
+        return PackageManager()
 
-    def __exit__(self, exc_type, exc_value, exc_tb) -> None:
-        """Call when context mgr leaves context, args are for exceptions."""
-        self.close()
+    def load_curated(self) -> Dict[str, Dict[str, str]]:
+        if os.path.exists(self.json_path):
+            try:
+                with open(self.json_path, 'r') as f:
+                    return json.load(f).get('packages', {})
+            except Exception:
+                pass
+        return {}
 
-    def close(self, commit=True) -> None:
-        """Take bool to toggle change commit (default True), and closes db."""
-        if commit:
-            self.conn.commit()
-        self.conn.close()
+    def save_curated(self, curated: dict) -> None:
+        try:
+            with open(self.json_path, 'w') as f:
+                json.dump({'packages': curated}, f, indent=2)
+        except Exception as e:
+            print(f"Error saving curated list: {e}", file=sys.stderr)
 
-    def execute(self, sql, params=None) -> None:
-        """Take sql str w optional named placeholders."""
-        self.cursor.execute(sql, params or ())
+    def load_filters(self) -> List[str]:
+        filters = []
+        if os.path.exists(self.filter_path):
+            try:
+                with open(self.filter_path, 'r') as f:
+                    for line in f:
+                        line = line.split('#', 1)[0].strip()
+                        if line:
+                            filters.extend(line.split())
+            except Exception:
+                pass
+        return filters
 
-    def query(self, sql, params=None) -> list:
-        """Take sql str w optional named placeholders and returns rows."""
-        self.cursor.execute(sql, params or ())
-        return self.cursor.fetchall()
+    def run(self, args) -> None:
+        curated = self.load_curated()
 
-    def repopulate(self) -> None:
-        """Rebuild entries for regular pkg and update all pkg native status."""
-        self.cursor.execute('DELETE FROM packages WHERE curated = 0')
-        pkglist = subprocess.check_output(['pacman', '-Qei'])
-        pkglist = pkglist.decode('utf-8')
-        nativelist = subprocess.getstatusoutput('pacman -Qqen')
-        for line in pkglist.split('\n'):
-            if re.search('^Name', line):
-                _, name = line.split(': ', 1)
-                native = 0
-                for record in nativelist[1].split('\n'):
-                    native = native + 1 if record == name else native
-            elif re.search('^Description', line):
-                _, description = line.split(': ', 1)
-                # rebuild entries for regular packages that are still installed
-                pkg = Package(name, 0, '', description, int(native))
-                pkg.add(self.cursor)
-                # refresh entries for curated pkg to set their native status
-                o = self.query("""Select * FROM packages WHERE curated = 1 and
-                               name = :name""", {'name': name})
-                for i in range(len(o)):
-                    tag = o[i][2]
-                    description = o[i][3]
-                    pkg = Package(name, 1, tag, description, int(native))
-                    pkg.modify(self.cursor)
-
-    def filter(self, filter_file) -> None:
-        """Take filter file obj, filter pkg or pkg group members from db."""
-        filters = ''
-        for line in filter_file:
-            filters += line
-            # convert to whitespace separated for use as pacman args
-            filters = filters.replace('\n', ' ')
-            # apply specified package and package group filters
-        grp_filter = subprocess.getstatusoutput('pacman -Sgq ' + filters)
-        for name in grp_filter[1].split('\n') + filters.split(' '):
-            self.execute("""DELETE FROM packages WHERE name = :name
-                         and curated = 0""", {'name': name})
-
-    def output(self, args) -> list:
-        """Take dict of parsed CLI args, sends formatted db info to stdout."""
-        if args['--verbose']:
-            print("name, status, tag, description, native")
-        native = 1 if args['--native'] else None
-        native = 0 if args['--foreign'] else native
-        if native is not None:
-            o = self.query("""SELECT * FROM packages WHERE curated = :curated
-                           AND native = :native ORDER BY name""", {
-                           'curated': args['--curated'], 'native': native})
-        else:
-            o = self.query("""SELECT * FROM packages WHERE curated = :curated
-                           ORDER BY name""", {'curated': args['--curated']})
-        status = ',curated,' if args['--curated'] else ',regular,'
-        for i in range(len(o)):
-            if not args['--verbose']:
-                print(o[i][0])
+        # Handle Package-Specific Queries/Mutations
+        if args.PACKAGE_NAME:
+            name = args.PACKAGE_NAME
+            if args.set:
+                curated[name] = {
+                    'tag': args.tag or (curated.get(name, {}).get('tag') or ''),
+                    'description': args.desc or (curated.get(name, {}).get('description') or '')
+                }
+                self.save_curated(curated)
+            elif args.unset:
+                if name in curated:
+                    del curated[name]
+                    self.save_curated(curated)
             else:
-                native = ",native" if o[i][4] == 1 else ",foreign"
-                print(o[i][0] + status + o[i][2] + ',"' + o[i][3] + '"'
-                      + native)
-        return o
-
-    def missing(self, args) -> list:
-        """Take dict of parsed CLI args, output list of missing curated."""
-        if args['--verbose']:
-            print("name, status, tag, description, native")
-        o = self.query("""SELECT * FROM packages WHERE curated = 1
-                       ORDER BY name""")
-        pkglist = subprocess.check_output(['pacman', '-Qqe'])
-        pkglist = pkglist.decode('utf-8')
-        result = ''
-        for i in range(len(o)):
-            if o[i][0] not in pkglist.split('\n'):
-                if not args['--verbose']:
-                    print(o[i][0])
+                # Display package info in CSV format using stdlib csv writer
+                installed = self.pm.get_installed()
+                writer = csv.writer(sys.stdout)
+                if name in curated:
+                    tag = curated[name].get('tag', '')
+                    desc = curated[name].get('description', '')
+                    native = installed.get(name, {}).get('native', 0)
+                    native_str = 'native' if native else 'foreign'
+                    writer.writerow([name, 'curated', tag, desc, native_str])
+                elif name in installed:
+                    desc = installed[name].get('description', '')
+                    native = installed[name].get('native', 0)
+                    native_str = 'native' if native else 'foreign'
+                    writer.writerow([name, 'regular', '', desc, native_str])
                 else:
-                    print(o[i][0] + ',curated,' + o[i][2]
-                          + ',"' + o[i][3] + '"')
-                result += o[i][0] + '\n'
-        return result
+                    print(f"package not explicitly installed ({name})", file=sys.stderr)
+                    sys.exit(1)
+            return
 
+        # Handle List Queries (-c, -r, -m)
+        installed = self.pm.get_installed()
+        pkgs = {}
 
-class __Control:
-    """A class to set up config and provide a simple control interface.
+        if args.curated:
+            for name, info in curated.items():
+                native = installed.get(name, {}).get('native', 0)
+                pkgs[name] = {
+                    'tag': info.get('tag', ''),
+                    'description': info.get('description', ''),
+                    'native': native,
+                    'status': 'curated'
+                }
+        elif args.regular:
+            filters = set(self.load_filters())
+            group_pkgs = set(self.pm.resolve_groups(list(filters)))
+            all_filters = filters | group_pkgs
+            for name, info in installed.items():
+                if name not in curated and name not in all_filters:
+                    pkgs[name] = {
+                        'tag': '',
+                        'description': info.get('description', ''),
+                        'native': info.get('native', 0),
+                        'status': 'regular'
+                    }
+        elif args.missing:
+            for name, info in curated.items():
+                if name not in installed:
+                    pkgs[name] = {
+                        'tag': info.get('tag', ''),
+                        'description': info.get('description', ''),
+                        'native': 0,
+                        'status': 'curated'
+                    }
 
-    Attributes
-    ----------
-    config_path
-        path to configuration directory
-    db_path
-        path to sqlite database file
-    filter_path
-        path to optional filter file
-    """
+        # Filter by Native/Foreign status
+        if args.native:
+            pkgs = {k: v for k, v in pkgs.items() if v['native'] == 1}
+        elif args.foreign:
+            pkgs = {k: v for k, v in pkgs.items() if v['native'] == 0}
 
-    def __init__(self) -> None:
-        """Set up file paths; respect XDG_CONFIG_HOME if it exists."""
-        xdg = os.environ.get('XDG_CONFIG_HOME')
-        if not xdg:
-            xdg = os.path.expandvars('$HOME') + '/.config'
-        self.config_path = xdg + '/pcurate'
-        os.makedirs(self.config_path, exist_ok=True)
-        self.db_path = self.config_path + '/pcurate.db'
-        self.filter_path = self.config_path + '/filter.txt'
-
-    def output(self, args) -> None:
-        """Take args, use to control package list output."""
-        with Database(self.db_path) as db:
-            self.filter(db)
-            db.output(args)
-
-    def missing(self, args) -> None:
-        """Take args, use to control display of missing curated pkgs."""
-        with Database(self.db_path) as db:
-            db.missing(args)
-
-    def display(self, args) -> None:
-        """Take args, use to control pkg changes/display."""
-        pkg = Package(args['PACKAGE_NAME'], args['--set'],
-                      args['--tag'], args['--desc'])
-        with Database(self.db_path) as db:
-            db.repopulate()
-            if args['--set'] or args['--unset']:
-                pkg.modify(db)
-                db.conn.commit()
-            else:
-                pkg.display(db)
-
-    def filter(self, db) -> None:
-        """Take db reference, use to control repopulate and filter of db."""
-        db.repopulate()
-        if os.path.isfile(self.filter_path):
-            with open(self.filter_path, 'r') as filter_file:
-                db.filter(filter_file)
-
+        # Format and Output Results
+        if args.verbose:
+            writer = csv.writer(sys.stdout)
+            writer.writerow(["name", "status", "tag", "description", "native"])
+            for name in sorted(pkgs.keys()):
+                info = pkgs[name]
+                native_str = "native" if info['native'] == 1 else "foreign"
+                writer.writerow([name, info['status'], info['tag'], info['description'], native_str])
+        else:
+            for name in sorted(pkgs.keys()):
+                print(name)
 
 def main() -> None:
-    """Dispatch commands based on CLI args parsed by docopt."""
-    c = __Control()
-    args = docopt(__doc__)
-    if args['--curated'] or args['--regular']:
-        c.output(args)
-    elif args['--missing']:
-        c.missing(args)
-    elif args['PACKAGE_NAME']:
-        c.display(args)
-    elif args['--version']:
-        print("pcurate version " + __version__)
+    parser = argparse.ArgumentParser(description="pcurate: A tool to organize and curate package lists.")
+    parser.add_argument('--version', action='version', version='pcurate version ' + __version__)
+    parser.add_argument('PACKAGE_NAME', nargs='?', help="Package name to query or set/unset curated status")
+    parser.add_argument('-u', '--unset', action='store_true', help="Unset package curated status")
+    parser.add_argument('-s', '--set', action='store_true', help="Set package curated status")
+    parser.add_argument('-t', '--tag', help="Set package tag")
+    parser.add_argument('-d', '--desc', help="Set package description")
 
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('-c', '--curated', action='store_true', help="Display all curated packages")
+    group.add_argument('-r', '--regular', action='store_true', help="Display packages not curated")
+    group.add_argument('-m', '--missing', action='store_true', help="Display missing curated packages")
+
+    filter_group = parser.add_mutually_exclusive_group()
+    filter_group.add_argument('-n', '--native', action='store_true', help="Limit display to native packages")
+    filter_group.add_argument('-f', '--foreign', action='store_true', help="Limit display to foreign packages")
+
+    parser.add_argument('-v', '--verbose', action='store_true', help="Display additional info in CSV format")
+
+    args = parser.parse_args()
+    if not args.PACKAGE_NAME and not (args.curated or args.regular or args.missing):
+        parser.print_usage()
+        sys.exit(1)
+
+    Pcurate().run(args)
 
 if __name__ == '__main__':
     main()

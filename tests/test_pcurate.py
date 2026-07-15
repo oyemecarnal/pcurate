@@ -1,151 +1,164 @@
 """Test pcurate module with pytest."""
 
-# standard lib import
+import csv
 import io
-
-# third party import
+import json
+import os
+import sys
 import pytest
-from pcurate import Database, Package
+from pcurate import Pcurate, PackageManager
 
+class MockPackageManager(PackageManager):
+    def get_installed(self) -> dict:
+        return {
+            'base': {'description': 'base_description', 'native': 1},
+            'comma_pkg': {'description': 'description, with, commas', 'native': 1},
+            'filter_one': {'description': 'desc', 'native': 1},
+            'filter_two': {'description': 'desc', 'native': 1},
+            'filter_three': {'description': 'desc', 'native': 1},
+            'pkg_0': {'description': 'desc_0', 'native': 1},
+            'pkg_1': {'description': 'desc_1', 'native': 1},
+            'pkg_2': {'description': 'desc_2', 'native': 1},
+            'pkg_3': {'description': 'desc_3', 'native': 1},
+            'pkg_4': {'description': 'desc_4', 'native': 1},
+            'pkg_5': {'description': 'desc_5', 'native': 1},
+        }
+
+    def resolve_groups(self, names: list) -> list:
+        if 'group_one' in names:
+            return ['filter_one', 'filter_three']
+        return []
 
 @pytest.fixture
-def db():
-    """Init a new in-memory db for each test function."""
-    db = Database(':memory:')
-    yield db
-    db.close()
+def temp_config(tmp_path):
+    """Init a temp config directory."""
+    return str(tmp_path)
 
+class DummyArgs:
+    def __init__(self, **kwargs):
+        self.PACKAGE_NAME = kwargs.get('PACKAGE_NAME', None)
+        self.unset = kwargs.get('unset', False)
+        self.set = kwargs.get('set', False)
+        self.tag = kwargs.get('tag', None)
+        self.desc = kwargs.get('desc', None)
+        self.curated = kwargs.get('curated', False)
+        self.regular = kwargs.get('regular', False)
+        self.missing = kwargs.get('missing', False)
+        self.native = kwargs.get('native', False)
+        self.foreign = kwargs.get('foreign', False)
+        self.verbose = kwargs.get('verbose', False)
 
-class __Control:
-    """A class for a simple test control interface; wrapper functions.
+def test_package_set(temp_config) -> None:
+    """Test setting a package curated status."""
+    p = Pcurate(temp_config, MockPackageManager())
+    
+    # Curate base package
+    args = DummyArgs(PACKAGE_NAME='base', set=True, tag='test_tag', desc='test_description')
+    p.run(args)
+    
+    curated = p.load_curated()
+    assert 'base' in curated
+    assert curated['base']['tag'] == 'test_tag'
+    assert curated['base']['description'] == 'test_description'
 
-    Attributes
-    ----------
-    name : db
-        db connect obj
-    """
+def test_package_unset(temp_config) -> None:
+    """Test unsetting a package curated status."""
+    p = Pcurate(temp_config, MockPackageManager())
+    
+    # Pre-populate curated list
+    curated = {'base': {'tag': 'test_tag', 'description': 'test_description'}}
+    p.save_curated(curated)
+    
+    # Unset base package
+    args = DummyArgs(PACKAGE_NAME='base', unset=True)
+    p.run(args)
+    
+    assert 'base' not in p.load_curated()
 
-    def __init__(self, db) -> None:
-        """Take db connect obj."""
-        self.db = db
+def test_regular_list(temp_config, capsys) -> None:
+    """Test listing regular packages."""
+    p = Pcurate(temp_config, MockPackageManager())
+    args = DummyArgs(regular=True)
+    p.run(args)
+    
+    captured = capsys.readouterr()
+    lines = captured.out.strip().split('\n')
+    assert len(lines) == 11  # 11 packages in mock
+    assert 'base' in lines
 
-    def display(self, pkg, repopulate=True) -> str:
-        """Take pkg ojb, bool to toggle repop; controls pkg changes/display."""
-        # optional bypass can be used to prevent resetting regular test entries
-        if repopulate:
-            self.db.repopulate()
-        return pkg.display(self.db)
+def test_filtering(temp_config, capsys) -> None:
+    """Test package exclusion via filter.txt."""
+    p = Pcurate(temp_config, MockPackageManager())
+    
+    # Write filters
+    with open(p.filter_path, 'w') as f:
+        f.write('filter_one\nfilter_three\n')
+        
+    args = DummyArgs(regular=True)
+    p.run(args)
+    
+    captured = capsys.readouterr()
+    lines = captured.out.strip().split('\n')
+    assert 'filter_one' not in lines
+    assert 'filter_three' not in lines
+    assert 'filter_two' in lines
 
-    def output(self, args) -> list:
-        """Take dict of simulated args; controls package list output."""
-        self.db.repopulate()
-        return self.db.output(args)
+def test_group_filtering(temp_config, capsys) -> None:
+    """Test package group expansion in filter.txt."""
+    p = Pcurate(temp_config, MockPackageManager())
+    
+    # Write group filter
+    with open(p.filter_path, 'w') as f:
+        f.write('group_one\n')
+        
+    args = DummyArgs(regular=True)
+    p.run(args)
+    
+    captured = capsys.readouterr()
+    lines = captured.out.strip().split('\n')
+    assert 'filter_one' not in lines
+    assert 'filter_three' not in lines
+    assert 'filter_two' in lines
 
-    def filter(self, pkgnames) -> None:
-        """Take filter text; control to apply filter using in memory obj."""
-        with io.StringIO(pkgnames) as filter_file:
-            self.db.filter(filter_file)
-
-
-def test_package_set(db) -> None:
-    """Test setting a package as curated status."""
-    c = __Control(db)
-    # add native test_package to db as a curated package with tag and desc
-    pkg = Package('test_package', 1, 'test_tag', 'test_description', 1)
-    pkg.add(db)
-    # output of package data from package display function
-    o = c.display(pkg)
-    name, curated, tag, description, native = o[0]
-    assert name == 'test_package'
-    assert curated == 1
-    assert tag == 'test_tag'
-    assert description == 'test_description'
-    assert native == 1
-    # package name in curated package list output modes
-    o = c.output({'--curated': True, '--verbose': False,
-                  '--native': False, '--foreign': False})
-    name = o[0][0]
-    assert name == 'test_package'
-    o = c.output({'--curated': True, '--verbose': True,
-                  '--native': False, '--foreign': False})
-    name, curated, tag, description, native = o[0]
-    assert name == 'test_package'
-    assert curated == 1
-    assert tag == 'test_tag'
-    assert description == 'test_description'
-    assert native == 1
-
-
-def test_package_modify(db) -> None:
-    """Test modifications of curated package data."""
-    c = __Control(db)
-    # add test_package to db as a curated package with attributes
-    pkg = Package('test_package', 1, 'test_tag', 'test_description', 0)
-    pkg.add(db)
-    # modify test package with new attributes and test display
-    pkg = Package('test_package', 1, 'new_tag', 'new_description', 1)
-    pkg.modify(db)
-    name, curated, tag, description, native = c.display(pkg)[0]
-    assert tag == 'new_tag'
-    assert description == 'new_description'
-    # check same test package attributes also in curated verbose output
-    o = c.output({'--curated': True, '--verbose': True,
-                  '--native': False, '--foreign': False})
-    name, curated, tag, description, native = o[0]
-    assert tag == 'new_tag'
-    assert description == 'new_description'
-    assert native == 1
-    # unset the test package
-    pkg = Package('test_package', 0, None, None)
-    pkg.modify(db)
-    o = c.display(pkg)
-    assert o == 'no_match'
-
-
-def test_regular_list(db) -> None:
-    """Check to make sure regular database output has some content."""
-    c = __Control(db)
-    # regular output should have a number of rows after repopulating
-    o = c.output({'--curated': False, '--regular': True, '--verbose': False,
-                  '--native': False, '--foreign': False})
-    assert len(o) > 5
-    o = c.output({'--curated': False, '--regular': True, '--verbose': True,
-                  '--native': False, '--foreign': False})
-    assert len(o) > 5
-    # 5 columns should be returned for entries in regular verbose output
-    assert len(o[0]) == 5
-
-
-def test_filtering(db) -> None:
-    """Test filter processing, using the in-memory file object."""
-    c = __Control(db)
-    # add 3 test packages, and filter 2 of them
-    pkg = Package('filter_one', 0, 'test_tag', 'test_description', 1)
-    pkg.add(db)
-    pkg = Package('filter_two', 0, 'test_tag', 'test_description', 1)
-    pkg.add(db)
-    pkg = Package('filter_three', 0, 'test_tag', 'test_description', 1)
-    pkg.add(db)
-    c.filter('filter_one\nfilter_three')
-    o = c.display(pkg, False)
-    assert o == 'no_match'
-    pkg = Package('filter_two', 0, 'test_tag', 'test_description', 1)
-    o = c.display(pkg, False)
-    assert o != 'no_match'
-    pkg = Package('filter_one', 0, 'test_tag', 'test_description', 1)
-    o = c.display(pkg, False)
-    assert o == 'no_match'
-
-
-def test_missing(db) -> None:
+def test_missing(temp_config, capsys) -> None:
     """Test detection of missing curated packages."""
-    # add curated test package
-    pkg = Package('test_package', 1, 'test_tag', 'test_description', 1)
-    pkg.add(db)
-    pkg = Package('base', 1, 'test_tag', 'test_description', 1)
-    pkg.add(db)
-    m = db.missing({'--verbose': False})
-    # test_package is not actually installed so should report missing
-    assert 'test_package' in m.split('\n')
-    # base package should be installed so should not report missing
-    assert 'base' not in m.split('\n')
+    p = Pcurate(temp_config, MockPackageManager())
+    
+    curated = {
+        'base': {'tag': 'tag', 'description': 'desc'},  # Installed
+        'missing_pkg': {'tag': 'tag', 'description': 'desc'}  # Not installed
+    }
+    p.save_curated(curated)
+    
+    args = DummyArgs(missing=True)
+    p.run(args)
+    
+    captured = capsys.readouterr()
+    lines = captured.out.strip().split('\n')
+    assert 'missing_pkg' in lines
+    assert 'base' not in lines
+
+def test_csv_quoting(temp_config, capsys) -> None:
+    """Test that CSV output is formatted robustly and description commas are escaped."""
+    p = Pcurate(temp_config, MockPackageManager())
+    
+    # Run in verbose mode
+    args = DummyArgs(regular=True, verbose=True)
+    p.run(args)
+    
+    captured = capsys.readouterr()
+    output = captured.out.strip()
+    
+    # Parse output using csv module
+    reader = csv.reader(io.StringIO(output))
+    rows = list(reader)
+    
+    header = rows[0]
+    assert header == ["name", "status", "tag", "description", "native"]
+    
+    # Find comma_pkg row
+    comma_pkg_row = next((row for row in rows if row[0] == 'comma_pkg'), None)
+    assert comma_pkg_row is not None
+    assert comma_pkg_row[1] == 'regular'
+    assert comma_pkg_row[3] == 'description, with, commas'
+    assert comma_pkg_row[4] == 'native'
