@@ -108,6 +108,7 @@ class Pcurate:
             return BrewManager()
         if shutil.which('dpkg-query') and shutil.which('apt-mark'):
             return AptManager()
+        print("Warning: No supported package manager (pacman, brew, apt) detected on this system.", file=sys.stderr)
         return PackageManager()
 
     def load_curated(self) -> Dict[str, Dict[str, str]]:
@@ -115,8 +116,11 @@ class Pcurate:
             try:
                 with open(self.json_path, 'r') as f:
                     return json.load(f).get('packages', {})
-            except Exception:
-                pass
+            except json.JSONDecodeError as e:
+                print(f"Error: {self.json_path} is malformed JSON.\nPlease fix the syntax error before continuing: {e}", file=sys.stderr)
+                sys.exit(1)
+            except Exception as e:
+                print(f"Error reading curated list: {e}", file=sys.stderr)
         return {}
 
     def save_curated(self, curated: dict) -> None:

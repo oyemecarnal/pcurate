@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "pcurate"
-version = "0.1.6"
-description = "utility for curating Arch Linux software package lists"
+version = "0.3.0"
+description = "utility for curating Arch Linux, macOS, and Debian software package lists"
 readme = 'README.md'
 authors = ["Scott Reed <multivac@posteo.net>"]
 repository = "https://github.com/thegibson/pcurate"
