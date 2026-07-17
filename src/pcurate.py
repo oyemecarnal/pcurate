@@ -183,16 +183,21 @@ class Database:
 
     def filter(self, filter_file) -> None:
         """Take filter file obj, filter pkg or pkg group members from db."""
-        filters = ''
+        filters = []
         for line in filter_file:
-            filters += line
-            # convert to whitespace separated for use as pacman args
-            filters = filters.replace('\n', ' ')
-            # apply specified package and package group filters
-        grp_filter = subprocess.getstatusoutput('pacman -Sgq ' + filters)
-        for name in grp_filter[1].split('\n') + filters.split(' '):
-            self.execute("""DELETE FROM packages WHERE name = :name
-                         and curated = 0""", {'name': name})
+            line = line.split('#')[0].strip()
+            if line:
+                filters.append(line)
+        if not filters:
+            return
+        
+        # apply specified package and package group filters securely
+        res = subprocess.run(['pacman', '-Sgq'] + filters, capture_output=True, text=True)
+        expanded = res.stdout.splitlines() if res.returncode == 0 else []
+        for name in expanded + filters:
+            if name:
+                self.execute("""DELETE FROM packages WHERE name = :name
+                             and curated = 0""", {'name': name})
 
     def output(self, args) -> list:
         """Take dict of parsed CLI args, sends formatted db info to stdout."""
